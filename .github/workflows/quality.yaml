@@ -19,7 +19,13 @@ jobs:
           echo "$HOME/.swamp/bin" >> "$GITHUB_PATH"
       - name: Format and lint
         run: swamp extension fmt manifest.yaml
+        env:
+          SWAMP_API_KEY: ${{ secrets.SWAMP_API_KEY }}
+          SWAMP_SIGNIN_TOKEN: ${{ secrets.SWAMP_SIGNIN_TOKEN }}
       - name: Unit tests
         run: deno test --allow-net --allow-read extensions/behaviors/beeper_test.ts
       - name: Quality gate
         run: swamp extension quality manifest.yaml
+        env:
+          SWAMP_API_KEY: ${{ secrets.SWAMP_API_KEY }}
+          SWAMP_SIGNIN_TOKEN: ${{ secrets.SWAMP_SIGNIN_TOKEN }}
