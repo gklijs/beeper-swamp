@@ -19,16 +19,18 @@ jobs:
           curl -fsSL https://swamp-club.com/install.sh | sh -s -- -V "$SWAMP_VERSION"
           echo "$HOME/.swamp/bin" >> "$GITHUB_PATH"
       - name: Format and lint
-        if: ${{ secrets.SWAMP_API_KEY != '' }}
-        run: swamp extension fmt manifest.yaml --check
+        run: |
+          if [ -z "$SWAMP_API_KEY" ]; then echo "No SWAMP_API_KEY, skipping."; exit 0; fi
+          swamp extension fmt manifest.yaml --check
         env:
           SWAMP_API_KEY: ${{ secrets.SWAMP_API_KEY }}
           SWAMP_SIGNIN_TOKEN: ${{ secrets.SWAMP_SIGNIN_TOKEN }}
       - name: Unit tests
         run: deno test --allow-net --allow-read extensions/behaviors/beeper_test.ts
       - name: Quality gate
-        if: ${{ secrets.SWAMP_API_KEY != '' }}
-        run: swamp extension quality manifest.yaml
+        run: |
+          if [ -z "$SWAMP_API_KEY" ]; then echo "No SWAMP_API_KEY, skipping."; exit 0; fi
+          swamp extension quality manifest.yaml
         env:
           SWAMP_API_KEY: ${{ secrets.SWAMP_API_KEY }}
           SWAMP_SIGNIN_TOKEN: ${{ secrets.SWAMP_SIGNIN_TOKEN }}
