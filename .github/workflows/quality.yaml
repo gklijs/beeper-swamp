@@ -15,7 +15,8 @@ jobs:
           deno-version: v2.x
       - name: Install swamp
         run: |
-          curl -fsSL https://swamp-club.com/install.sh | sh
+          SWAMP_VERSION="$(grep '^swampVersion:' .swamp.yaml | awk '{print $2}')"
+          curl -fsSL https://swamp-club.com/install.sh | sh -s -- -V "$SWAMP_VERSION"
           echo "$HOME/.swamp/bin" >> "$GITHUB_PATH"
       - name: Format and lint
         if: ${{ secrets.SWAMP_API_KEY != '' }}
