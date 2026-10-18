@@ -268,6 +268,160 @@ Deno.test("checkToken derives expiry from introspect", async () => {
   assertEquals(data.expiresAt, new Date(1_700_003_600 * 1000).toISOString());
 });
 
+Deno.test("searchMessages queries /v1/messages/search", async () => {
+  const { result: resource, calls } = await withMockedFetch(
+    (req) => {
+      const url = new URL(req.url);
+      assertEquals(url.pathname, "/v1/messages/search");
+      assertEquals(url.searchParams.get("query"), "dinner");
+      return Response.json({
+        hasMore: false,
+        items: [
+          {
+            id: "m9",
+            chatID: "!room:beeper.com",
+            senderID: "@bob:beeper.com",
+            timestamp: "2026-05-05T20:20:12.497Z",
+            text: "dinner at 7?",
+            isSender: false,
+            isDeleted: false,
+            isHidden: false,
+          },
+        ],
+        newestCursor: "n",
+        oldestCursor: "o",
+      });
+    },
+    async () => {
+      const { context, getWrittenResources } = createModelTestContext({
+        globalArgs: { baseUrl: "http://127.0.0.1:23373", accessToken: "t" },
+      });
+      await behavior.methods.searchMessages.execute(
+        { query: "dinner", maxMessages: 50 },
+        context as unknown as ExecuteContext<"searchMessages">,
+      );
+      return getWrittenResources()[0];
+    },
+  );
+  assertEquals(calls.length, 1);
+  assertEquals(resource.specName, "search");
+  const data = resource.data as Record<string, unknown>;
+  assertEquals(data.query, "dinner");
+  assertEquals(data.count, 1);
+});
+
+Deno.test("broadcast sends to every chat and reports failures", async () => {
+  const { result: resource, calls } = await withMockedFetch(
+    (req) => {
+      if (new URL(req.url).pathname.endsWith("chat-b/messages")) {
+        return Response.json({ chatID: "chat-b", pendingMessageID: "p-b" });
+      }
+      return new Response("boom", { status: 500 });
+    },
+    async () => {
+      const { context, getWrittenResources } = createModelTestContext({
+        globalArgs: { baseUrl: "http://127.0.0.1:23373", accessToken: "t" },
+      });
+      await behavior.methods.broadcast.execute(
+        { chatIDs: ["chat-a", "chat-b"], text: "alert", queueOnFailure: false },
+        context as unknown as ExecuteContext<"broadcast">,
+      );
+      return getWrittenResources()[0];
+    },
+  );
+  assertEquals(calls.length, 2);
+  assertEquals(resource.specName, "broadcast");
+  const data = resource.data as Record<string, unknown>;
+  assertEquals(data.sentCount, 1);
+  assertEquals(data.failedCount, 1);
+});
+
+Deno.test("broadcast queues transient failures to the outbox", async () => {
+  const { result: resources, calls } = await withMockedFetch(
+    () => new Response("slow down", { status: 429 }),
+    async () => {
+      const { context, getWrittenResources } = createModelTestContext({
+        globalArgs: { baseUrl: "http://127.0.0.1:23373", accessToken: "t" },
+      });
+      await behavior.methods.broadcast.execute(
+        { chatIDs: ["chat-a"], text: "alert", queueOnFailure: true },
+        context as unknown as ExecuteContext<"broadcast">,
+      );
+      return getWrittenResources();
+    },
+  );
+  assertEquals(calls.length, 1);
+  assertEquals(resources.length, 2);
+  assertEquals(resources[0].specName, "broadcast");
+  assertEquals(resources[1].specName, "outbox");
+  const outbox = resources[1].data as Record<string, unknown>;
+  const pending = outbox.pending as Array<Record<string, unknown>>;
+  assertEquals(pending.length, 1);
+  assertEquals(pending[0].chatID, "chat-a");
+});
+
+Deno.test("queueMessage writes an outbox entry", async () => {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: {
+      baseUrl: "http://127.0.0.1:23373",
+      accessToken: "t",
+      defaultChatID: "!room:beeper.com",
+    },
+  });
+  await behavior.methods.queueMessage.execute(
+    { text: "later" },
+    context as unknown as ExecuteContext<"queueMessage">,
+  );
+  const resources = getWrittenResources();
+  assertEquals(resources[0].specName, "outbox");
+  const data = resources[0].data as Record<string, unknown>;
+  const pending = data.pending as Array<Record<string, unknown>>;
+  assertEquals(pending.length, 1);
+  assertEquals(pending[0].text, "later");
+});
+
+Deno.test("flushQueue delivers pending and keeps failures", async () => {
+  const { result: resource, calls } = await withMockedFetch(
+    (req) => {
+      if (new URL(req.url).pathname.includes("good")) {
+        return Response.json({ chatID: "good", pendingMessageID: "p-1" });
+      }
+      return new Response("down", { status: 503 });
+    },
+    async () => {
+      const { context, getWrittenResources } = createModelTestContext({
+        globalArgs: { baseUrl: "http://127.0.0.1:23373", accessToken: "t" },
+      });
+      await behavior.methods.flushQueue.execute(
+        {
+          maxFlush: 25,
+          pending: [
+            {
+              chatID: "good",
+              text: "hi",
+              queuedAt: "2026-01-01T00:00:00.000Z",
+            },
+            {
+              chatID: "bad",
+              text: "yo",
+              queuedAt: "2026-01-01T00:00:00.000Z",
+            },
+          ],
+        },
+        context as unknown as ExecuteContext<"flushQueue">,
+      );
+      return getWrittenResources()[0];
+    },
+  );
+  assertEquals(calls.length, 2);
+  assertEquals(resource.specName, "outbox");
+  const data = resource.data as Record<string, unknown>;
+  const flushed = data.flushed as Array<unknown>;
+  const pending = data.pending as Array<unknown>;
+  assertEquals(flushed.length, 1);
+  assertEquals(pending.length, 1);
+});
+
 Deno.test("listChats retries once when the API is throttled", async () => {
   const { result: resource, calls } = await withMockedFetch([
     new Response("slow down", {

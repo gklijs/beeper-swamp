@@ -1,0 +1,25 @@
+name: quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Install swamp
+        run: |
+          curl -fsSL https://swamp-club.com/install.sh | sh
+          echo "$HOME/.swamp/bin" >> "$GITHUB_PATH"
+      - name: Format and lint
+        run: swamp extension fmt manifest.yaml
+      - name: Unit tests
+        run: deno test --allow-net --allow-read extensions/behaviors/beeper_test.ts
+      - name: Quality gate
+        run: swamp extension quality manifest.yaml

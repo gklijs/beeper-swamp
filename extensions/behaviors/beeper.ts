@@ -124,6 +124,50 @@ const SentMessageSchema = z.object({
   sentAt: z.string(),
 });
 
+/** Output of the `searchMessages` method. */
+const SearchResultsSchema = z.object({
+  query: z.string(),
+  messages: z.array(MessageSchema.extend({
+    chatID: z.string().optional(),
+  })),
+  count: z.number().int(),
+  truncated: z.boolean(),
+  oldestCursor: z.string().optional(),
+  newestCursor: z.string().optional(),
+  fetchedAt: z.string(),
+});
+
+/** Output of the `broadcast` method. */
+const BroadcastSchema = z.object({
+  text: z.string(),
+  sent: z.array(SentMessageSchema),
+  failed: z.array(z.object({
+    chatID: z.string(),
+    error: z.string(),
+  })),
+  sentCount: z.number().int(),
+  failedCount: z.number().int(),
+  sentAt: z.string(),
+});
+
+/** Output of the `queueMessage` / `flushQueue` methods. */
+const QueueSchema = z.object({
+  text: z.string().optional(),
+  pending: z.array(z.object({
+    chatID: z.string(),
+    text: z.string(),
+    replyToMessageID: z.string().optional(),
+    queuedAt: z.string(),
+    lastError: z.string().optional(),
+  })),
+  flushed: z.array(SentMessageSchema).optional(),
+  failed: z.array(z.object({
+    chatID: z.string(),
+    error: z.string(),
+  })).optional(),
+  fetchedAt: z.string(),
+});
+
 /** Output of the `checkToken` method. */
 const TokenSchema = z.object({
   active: z.boolean(),
@@ -176,6 +220,70 @@ const SendMessageArgsSchema = z.object({
   replyToMessageID: z.string().min(1).optional().describe(
     "Message ID to reply to.",
   ),
+});
+
+/** Arguments for `searchMessages` (`GET /v1/messages/search`). */
+const SearchMessagesArgsSchema = z.object({
+  query: z.string().min(1).describe("Literal word to search for."),
+  maxMessages: z.number().int().min(1).max(200).default(50).describe(
+    "Overall cap across pages (API returns max 20 per page).",
+  ),
+  chatIDs: z.array(z.string().min(1)).optional().describe(
+    "Limit to specific chat IDs.",
+  ),
+  accountIDs: z.array(z.string().min(1)).optional().describe(
+    "Limit to specific account IDs.",
+  ),
+  sender: z.string().min(1).optional().describe(
+    '"me", "others", or a user ID.',
+  ),
+  dateAfter: z.string().optional().describe("ISO-8601 lower bound."),
+  dateBefore: z.string().optional().describe("ISO-8601 upper bound."),
+  cursor: z.string().optional().describe("Opaque pagination cursor."),
+  direction: z.enum(["after", "before"]).optional().describe(
+    "Pagination direction used with `cursor`.",
+  ),
+});
+
+/** Arguments for `broadcast`. */
+const BroadcastArgsSchema = z.object({
+  chatIDs: z.array(z.string().min(1)).min(1).max(50).describe(
+    "Destination chats (max 50 per call).",
+  ),
+  text: z.string().min(1).describe("Message body sent to every chat."),
+  replyToMessageID: z.string().min(1).optional().describe(
+    "Message ID to reply to (same value used for every chat).",
+  ),
+  queueOnFailure: z.boolean().default(true).describe(
+    "Queue chats that fail with a transient error for later flushQueue.",
+  ),
+});
+
+/** Arguments for `queueMessage`. */
+const QueueMessageArgsSchema = z.object({
+  chatID: z.string().min(1).optional().describe(
+    "Destination chat; falls back to globalArguments.defaultChatID.",
+  ),
+  text: z.string().min(1).describe("Message body."),
+  replyToMessageID: z.string().min(1).optional().describe(
+    "Message ID to reply to.",
+  ),
+});
+
+/** Arguments for `flushQueue`. */
+const FlushQueueArgsSchema = z.object({
+  maxFlush: z.number().int().min(1).max(100).default(25).describe(
+    "Maximum queued messages to attempt per call.",
+  ),
+});
+
+/** One queued message stored in the `outbox` resource. */
+const QueuedMessageSchema = z.object({
+  chatID: z.string(),
+  text: z.string(),
+  replyToMessageID: z.string().optional(),
+  queuedAt: z.string(),
+  lastError: z.string().optional(),
 });
 
 /** HTTP options for one Beeper request. */
@@ -453,10 +561,91 @@ function resolveChatID(
   return chatID;
 }
 
+/**
+ * Parse one message record into the MessageSchema shape.
+ *
+ * @param message - Raw message record from the API.
+ * @returns The normalized message, or `null` when it has no ID.
+ */
+function parseMessage(
+  message: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    id: readString(message, "id") ?? "",
+    chatID: readString(message, "chatID"),
+    senderID: readString(message, "senderID") ?? "",
+    senderName: readString(message, "senderName"),
+    timestamp: readString(message, "timestamp") ?? "",
+    text: readString(message, "text"),
+    type: readString(message, "type"),
+    isSender: readBoolean(message, "isSender"),
+    isDeleted: readBoolean(message, "isDeleted"),
+    isHidden: readBoolean(message, "isHidden"),
+    linkedMessageID: readString(message, "linkedMessageID"),
+  };
+}
+
+/**
+ * Send one text message, returning the SentMessageSchema shape.
+ *
+ * @param globalArgs - Resolved global arguments (base URL and token).
+ * @param chatID - Destination chat.
+ * @param text - Message body.
+ * @param replyToMessageID - Optional message ID to reply to.
+ * @param signal - Optional abort signal.
+ * @returns The sent-message record.
+ */
+async function postText(
+  globalArgs: BeeperGlobalArgs,
+  chatID: string,
+  text: string,
+  replyToMessageID: string | undefined,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const body: Record<string, unknown> = { text };
+  if (replyToMessageID) {
+    body.replyToMessageID = replyToMessageID;
+  }
+  const payload = asRecord(
+    await beeperRequest(
+      globalArgs,
+      `/v1/chats/${encodeURIComponent(chatID)}/messages`,
+      { method: "POST", body: JSON.stringify(body) },
+      signal,
+    ),
+  );
+  const pendingMessageID = payload
+    ? readString(payload, "pendingMessageID")
+    : undefined;
+  if (!pendingMessageID) {
+    throw new Error(
+      "Beeper did not return a pendingMessageID; the message may not have been accepted.",
+    );
+  }
+  return {
+    chatID: readString(payload ?? {}, "chatID") ?? chatID,
+    pendingMessageID,
+    text,
+    replyToMessageID,
+    sentAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Decide whether a send error is transient (worth queueing for retry).
+ *
+ * @param message - Error message from postText.
+ * @returns True for throttling, 5xx, timeouts and network failures.
+ */
+function isTransientError(message: string): boolean {
+  return /429|5\d\d|timeout|timed out|failed|transient|ECONN|ENOTFOUND|retry/i
+    .test(message);
+}
+
 /** Behavior definition for the Beeper Desktop integration. */
 export const behavior = {
   type: "@gklijs/beeper",
-  version: "2026.10.17.1",
+  version: "2026.10.18.1",
   globalArguments: BeeperGlobalArgsSchema,
   resources: {
     "health": {
@@ -488,6 +677,24 @@ export const behavior = {
       schema: TokenSchema,
       lifetime: "7d",
       garbageCollection: 10,
+    },
+    "search": {
+      description: "Cross-chat message search results",
+      schema: SearchResultsSchema,
+      lifetime: "7d",
+      garbageCollection: 10,
+    },
+    "broadcast": {
+      description: "Multi-chat broadcast result",
+      schema: BroadcastSchema,
+      lifetime: "30d",
+      garbageCollection: 20,
+    },
+    "outbox": {
+      description: "Retry queue for messages that failed with transient errors",
+      schema: QueueSchema,
+      lifetime: "30d",
+      garbageCollection: 5,
     },
   },
   checks: {
@@ -906,6 +1113,271 @@ export const behavior = {
         });
         context.logger.info("Token active: {active}", {
           active: readBoolean(payload, "active"),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    searchMessages: {
+      description:
+        "Search messages across chats via /v1/messages/search (literal word match)",
+      kind: "list",
+      arguments: SearchMessagesArgsSchema,
+      execute: async (
+        args: z.infer<typeof SearchMessagesArgsSchema>,
+        context: {
+          globalArgs: BeeperGlobalArgs;
+          logger: { info(msg: string, ...args: unknown[]): void };
+          writeResource: (
+            specName: string,
+            name: string,
+            data: Record<string, unknown>,
+          ) => Promise<{ name: string }>;
+          signal?: AbortSignal;
+        },
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        context.logger.info(
+          "Searching Beeper messages for {query} (cap {max})",
+          { query: args.query, max: args.maxMessages },
+        );
+        const messages: Array<Record<string, unknown>> = [];
+        let cursor = args.cursor;
+        let direction = args.direction;
+        let truncated = false;
+        let oldestCursor: string | undefined;
+        let newestCursor: string | undefined;
+
+        for (;;) {
+          const query = new URLSearchParams();
+          query.set("query", args.query);
+          query.set("limit", "20");
+          for (const chatID of args.chatIDs ?? []) {
+            query.append("chatIDs", chatID);
+          }
+          for (const accountID of args.accountIDs ?? []) {
+            query.append("accountIDs", accountID);
+          }
+          if (args.sender) query.set("sender", args.sender);
+          if (args.dateAfter) query.set("dateAfter", args.dateAfter);
+          if (args.dateBefore) query.set("dateBefore", args.dateBefore);
+          if (cursor) {
+            query.set("cursor", cursor);
+            query.set("direction", direction ?? "before");
+          }
+          const envelope = asListEnvelope(
+            await beeperRequest(
+              context.globalArgs,
+              `/v1/messages/search?${query.toString()}`,
+              { method: "GET", retryOnThrottle: true },
+              context.signal,
+            ),
+            "/v1/messages/search",
+          );
+          oldestCursor = envelope.oldestCursor ?? oldestCursor;
+          newestCursor = envelope.newestCursor ?? newestCursor;
+          for (const message of envelope.items) {
+            if (!readString(message, "id")) continue;
+            messages.push(parseMessage(message));
+          }
+          cursor = envelope.oldestCursor;
+          direction = "before";
+          if (
+            !envelope.hasMore || !cursor || messages.length >= args.maxMessages
+          ) {
+            truncated = envelope.hasMore && messages.length >= args.maxMessages;
+            break;
+          }
+        }
+
+        const written = messages.slice(0, args.maxMessages);
+        const handle = await context.writeResource("search", "latest", {
+          query: args.query,
+          messages: written,
+          count: written.length,
+          truncated,
+          oldestCursor,
+          newestCursor,
+          fetchedAt: new Date().toISOString(),
+        });
+        context.logger.info("Found {count} message(s) for {query}", {
+          count: written.length,
+          query: args.query,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    broadcast: {
+      description:
+        "Send the same text to multiple chats; transient failures are queued for flushQueue",
+      kind: "action",
+      arguments: BroadcastArgsSchema,
+      execute: async (
+        args: z.infer<typeof BroadcastArgsSchema>,
+        context: {
+          globalArgs: BeeperGlobalArgs;
+          logger: { info(msg: string, ...args: unknown[]): void };
+          writeResource: (
+            specName: string,
+            name: string,
+            data: Record<string, unknown>,
+          ) => Promise<{ name: string }>;
+          signal?: AbortSignal;
+        },
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        context.logger.info(
+          "Broadcasting to {count} chat(s)",
+          { count: args.chatIDs.length },
+        );
+        const sent: Array<Record<string, unknown>> = [];
+        const failed: Array<Record<string, unknown>> = [];
+        const queued: Array<Record<string, unknown>> = [];
+        for (const chatID of args.chatIDs) {
+          try {
+            sent.push(
+              await postText(
+                context.globalArgs,
+                chatID,
+                args.text,
+                args.replyToMessageID,
+                context.signal,
+              ),
+            );
+          } catch (error) {
+            const message = errorMessage(error);
+            failed.push({ chatID, error: message });
+            if (args.queueOnFailure && isTransientError(message)) {
+              queued.push({
+                chatID,
+                text: args.text,
+                replyToMessageID: args.replyToMessageID,
+                queuedAt: new Date().toISOString(),
+                lastError: message,
+              });
+            }
+          }
+        }
+        const sentAt = new Date().toISOString();
+        const handle = await context.writeResource("broadcast", "latest", {
+          text: args.text,
+          sent,
+          failed,
+          sentCount: sent.length,
+          failedCount: failed.length,
+          sentAt,
+        });
+        const handles = [handle];
+        if (queued.length > 0) {
+          handles.push(
+            await context.writeResource("outbox", "latest", {
+              pending: queued,
+              fetchedAt: sentAt,
+            }),
+          );
+        }
+        context.logger.info("Broadcast: {sent} sent, {failed} failed", {
+          sent: sent.length,
+          failed: failed.length,
+        });
+        return { dataHandles: handles };
+      },
+    },
+    queueMessage: {
+      description:
+        "Queue a message in the outbox for later delivery via flushQueue",
+      kind: "action",
+      arguments: QueueMessageArgsSchema,
+      execute: async (
+        args: z.infer<typeof QueueMessageArgsSchema>,
+        context: {
+          globalArgs: BeeperGlobalArgs;
+          logger: { info(msg: string, ...args: unknown[]): void };
+          writeResource: (
+            specName: string,
+            name: string,
+            data: Record<string, unknown>,
+          ) => Promise<{ name: string }>;
+          signal?: AbortSignal;
+        },
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        const chatID = resolveChatID(
+          args.chatID,
+          context.globalArgs.defaultChatID,
+        );
+        const entry = {
+          chatID,
+          text: args.text,
+          replyToMessageID: args.replyToMessageID,
+          queuedAt: new Date().toISOString(),
+        };
+        context.logger.info("Queueing a message for chat {chatID}", {
+          chatID,
+        });
+        const handle = await context.writeResource("outbox", "latest", {
+          pending: [entry],
+          fetchedAt: entry.queuedAt,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    flushQueue: {
+      description:
+        "Attempt delivery of queued outbox messages (pass pending from the outbox resource)",
+      kind: "action",
+      arguments: FlushQueueArgsSchema.extend({
+        pending: z.array(QueuedMessageSchema).min(1).describe(
+          "Queued entries from the outbox resource.",
+        ),
+      }),
+      execute: async (
+        args: z.infer<typeof FlushQueueArgsSchema> & {
+          pending: z.infer<typeof QueuedMessageSchema>[];
+        },
+        context: {
+          globalArgs: BeeperGlobalArgs;
+          logger: { info(msg: string, ...args: unknown[]): void };
+          writeResource: (
+            specName: string,
+            name: string,
+            data: Record<string, unknown>,
+          ) => Promise<{ name: string }>;
+          signal?: AbortSignal;
+        },
+      ): Promise<{ dataHandles: Array<{ name: string }> }> => {
+        const batch = args.pending.slice(0, args.maxFlush);
+        context.logger.info("Flushing {count} queued message(s)", {
+          count: batch.length,
+        });
+        const flushed: Array<Record<string, unknown>> = [];
+        const failed: Array<Record<string, unknown>> = [];
+        const remaining: Array<Record<string, unknown>> = args.pending.slice(
+          args.maxFlush,
+        );
+        for (const entry of batch) {
+          try {
+            flushed.push(
+              await postText(
+                context.globalArgs,
+                entry.chatID,
+                entry.text,
+                entry.replyToMessageID,
+                context.signal,
+              ),
+            );
+          } catch (error) {
+            const message = errorMessage(error);
+            failed.push({ chatID: entry.chatID, error: message });
+            remaining.push({ ...entry, lastError: message });
+          }
+        }
+        const fetchedAt = new Date().toISOString();
+        const handle = await context.writeResource("outbox", "latest", {
+          pending: remaining,
+          flushed,
+          failed,
+          fetchedAt,
+        });
+        context.logger.info("Flush: {ok} delivered, {left} remaining", {
+          ok: flushed.length,
+          left: remaining.length,
         });
         return { dataHandles: [handle] };
       },

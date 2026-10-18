@@ -74,7 +74,25 @@ swamp behavior run beeper checkToken
 - `listMessages` — read recent messages from one chat (falls back to
   `defaultChatID`).
 - `sendMessage` — send a text message, optionally as a reply.
+- `searchMessages` — search messages across chats via `/v1/messages/search`
+  (literal word match, filters for chats, accounts, sender, date range).
+- `broadcast` — send the same text to up to 50 chats; transient failures are
+  queued to the `outbox` resource when `queueOnFailure` is set.
+- `queueMessage` — stage a message in the `outbox` for later delivery.
+- `flushQueue` — deliver queued `outbox` entries (pass `pending` from the
+  outbox resource); failures stay queued with `lastError`.
 - `checkToken` — introspect the access token and report its expiry.
+
+```sh
+swamp behavior run beeper searchMessages --query 'dinner'
+swamp behavior run beeper broadcast --chatIDs '["!a:x","!b:x"]' --text 'deploy done'
+```
+
+## Workflows
+
+`workflows/workflow-poll-alerts.yaml` (`@gklijs/beeper-poll-alerts`) polls a
+chat, searches for a keyword, forwards a summary, and flushes queued retries —
+runnable documentation for wiring the behavior into a pipeline:
 
 ## How it works
 

@@ -1,0 +1,82 @@
+id: 3f6a1c2e-7b4d-4e8f-9a0c-5d2e6f7a8b9c
+name: "@gklijs/beeper-poll-alerts"
+description: >-
+  Poll a Beeper chat for new messages, search across chats for a keyword,
+  forward a summary to the on-call chat, and flush any queued retries.
+  Runnable documentation for @gklijs/beeper: shows the
+  listMessages-then-search-then-send wiring and the flushQueue retry step.
+inputs:
+  type: object
+  additionalProperties: false
+  properties:
+    beeperModel:
+      type: string
+      minLength: 1
+      description: Behavior instance name bound to @gklijs/beeper.
+    keyword:
+      type: string
+      minLength: 1
+      description: Literal word to search for across chats.
+    summaryText:
+      type: string
+      minLength: 1
+      description: Summary text forwarded to the on-call chat.
+  required: [beeperModel, keyword, summaryText]
+jobs:
+  - name: poll-alerts
+    steps:
+      - name: read-latest
+        description: Read the latest messages from the alert chat.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.beeperModel }}"
+          methodName: listMessages
+          inputs:
+            maxMessages: 20
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: search-keywords
+        description: Search across chats for the alert keyword.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.beeperModel }}"
+          methodName: searchMessages
+          inputs:
+            query: "${{ inputs.keyword }}"
+            maxMessages: 20
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: forward
+        description: Forward the summary to the on-call chat.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.beeperModel }}"
+          methodName: sendMessage
+          inputs:
+            text: "${{ inputs.summaryText }}"
+        dependsOn:
+          - step: read-latest
+            condition: { type: succeeded }
+          - step: search-keywords
+            condition: { type: succeeded }
+        weight: 0
+        allowFailure: false
+      - name: flush-retries
+        description: Deliver queued messages from earlier transient failures.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.beeperModel }}"
+          methodName: flushQueue
+          inputs:
+            maxFlush: 25
+            pending: []
+        dependsOn:
+          - step: forward
+            condition: { type: succeeded }
+        weight: 0
+        allowFailure: true
+    dependsOn: []
+    weight: 0
+version: 1
