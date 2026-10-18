@@ -1,0 +1,4 @@
+version: 1
+accept:
+  - rule: behavior-spelling
+    reason: "Beeper Desktop integration targets the current swamp release; the behavior spelling is the current convention."

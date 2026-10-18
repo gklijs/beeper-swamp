@@ -1,0 +1,16 @@
+manifestVersion: 1
+name: "@gklijs/beeper"
+version: "2026.10.17.1"
+license: MIT
+description: "Integrate the Beeper Desktop local API with swamp: probe account health, list chats and messages, send messages from workflows, and introspect the access token."
+
+repository: https://github.com/gklijs/beeper-swamp
+
+additionalFiles:
+  - README.md
+  - LICENSE
+
+behaviors:
+  - beeper.ts
+
+platforms: []
